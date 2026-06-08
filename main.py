@@ -3,7 +3,7 @@ import secrets
 from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import pyschlage
 
 class LockState(BaseModel):
@@ -17,8 +17,18 @@ class LockState(BaseModel):
     mac_address: Optional[str] = None
 
 class AccessCodeBase(BaseModel):
-    name: str
-    code: str
+    name: str = Field(
+        ...,
+        min_length=1,
+        max_length=50,
+        pattern=r"^[a-zA-Z0-9 ]+$",
+    )
+    code: str = Field(
+        ...,
+        min_length=4,
+        max_length=8,
+        pattern=r"^\d{4,8}$",
+    )
 
 class AccessCodeResponse(AccessCodeBase):
     access_code_id: Optional[str] = None
@@ -53,6 +63,16 @@ async def check_api_secret(request: Request, call_next):
     if request.headers.get("X-API-Secret") != API_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
     return await call_next(request)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    if request.url.path != "/auth/token":
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 def get_current_client(token: str = Depends(oauth2_scheme)) -> pyschlage.Schlage:
     client = _active_sessions.get(token)
