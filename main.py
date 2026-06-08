@@ -4,6 +4,9 @@ from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 import pyschlage
 
 class LockState(BaseModel):
@@ -47,6 +50,10 @@ app = FastAPI(
     description="FastAPI wrapper for pyschlage with Bearer Token Authentication.",
     version="1.1.0"
 )
+
+limiter = Limiter(key_func=get_remote_address, headers_enabled=True)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
@@ -97,7 +104,8 @@ def get_lock_by_id(device_id: str, client: pyschlage.Schlage = Depends(get_curre
     raise HTTPException(status_code=404, detail=f"Lock {device_id} not found")
 
 @app.post("/auth/token", response_model=TokenResponse, tags=["Authentication"])
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
+@limiter.limit("60/minute")
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     try:
         auth = pyschlage.Auth(form_data.username, form_data.password)
         client = pyschlage.Schlage(auth)
