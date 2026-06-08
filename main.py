@@ -2,15 +2,20 @@ import os
 import secrets
 import time
 import asyncio
+import logging
 from typing import List, Optional, Dict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 import pyschlage
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("pyschlage-api")
 
 class LockState(BaseModel):
     device_id: str
@@ -39,6 +44,16 @@ class AccessCodeBase(BaseModel):
 class AccessCodeResponse(AccessCodeBase):
     access_code_id: Optional[str] = None
 
+    @classmethod
+    def masked(cls, code_obj) -> "AccessCodeResponse":
+        raw = code_obj.code
+        masked = raw[:2] + "*" * (len(raw) - 2) if len(raw) > 2 else raw
+        return cls(
+            access_code_id=getattr(code_obj, "access_code_id", None),
+            name=code_obj.name,
+            code=masked,
+        )
+
 class LockLogResponse(BaseModel):
     created_at: Optional[str] = None
     message: Optional[str] = None
@@ -65,6 +80,14 @@ limiter = Limiter(key_func=get_remote_address, headers_enabled=True)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else [],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
 SESSION_TTL = 86400
@@ -74,6 +97,8 @@ _active_sessions: Dict[str, dict] = {}
 _user_tokens: Dict[str, str] = {}
 
 API_SECRET = os.environ.get("API_SECRET")
+if API_SECRET is None:
+    raise RuntimeError("API_SECRET environment variable is required")
 
 
 async def cleanup_expired_sessions():
@@ -110,6 +135,24 @@ async def add_security_headers(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store"
     return response
 
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    if request.method in ("POST", "PUT", "DELETE"):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > 1024 * 100:
+            raise HTTPException(status_code=413, detail="Request body too large")
+    return await call_next(request)
+
+@app.middleware("http")
+async def validate_content_type(request: Request, call_next):
+    if request.method in ("POST", "PUT"):
+        if request.url.path == "/auth/token":
+            return await call_next(request)
+        ct = request.headers.get("content-type", "")
+        if "application/json" not in ct:
+            raise HTTPException(status_code=415, detail="Content-Type must be application/json")
+    return await call_next(request)
+
 def get_current_client(token: str = Depends(oauth2_scheme)) -> pyschlage.Schlage:
     session = _active_sessions.get(token)
     if not session:
@@ -132,14 +175,18 @@ def get_current_client(token: str = Depends(oauth2_scheme)) -> pyschlage.Schlage
 def get_lock_by_id(device_id: str, client: pyschlage.Schlage = Depends(get_current_client)):
     try:
         locks = client.locks()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch locks: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch locks")
 
     for lock in locks:
         if lock.device_id == device_id:
             return lock
 
-    raise HTTPException(status_code=404, detail=f"Lock {device_id} not found")
+    raise HTTPException(status_code=404, detail="Lock not found")
+
+@app.get("/health", tags=["Health"])
+def health_check():
+    return {"status": "healthy"}
 
 @app.post("/auth/token", response_model=TokenResponse, tags=["Authentication"])
 @limiter.limit("60/minute")
@@ -194,8 +241,8 @@ def list_locks(client: pyschlage.Schlage = Depends(get_current_client)):
                 mac_address=getattr(lock, 'mac_address', None)
             ) for lock in locks
         ]
-    except Exception as e:
-         raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+         raise HTTPException(status_code=500, detail="Failed to fetch locks")
 
 @app.get("/locks/{device_id}", response_model=LockState, tags=["Locks"])
 def get_lock(lock = Depends(get_lock_by_id)):
@@ -211,20 +258,24 @@ def get_lock(lock = Depends(get_lock_by_id)):
     )
 
 @app.post("/locks/{device_id}/lock", response_model=Dict[str, str], tags=["Locks"])
-def lock_door(lock = Depends(get_lock_by_id)):
+def lock_door(confirm: bool = Query(...), lock = Depends(get_lock_by_id)):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Missing confirmation parameter")
     try:
         lock.lock()
         return {"status": "success", "message": "Door locked successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to lock door")
 
 @app.post("/locks/{device_id}/unlock", response_model=Dict[str, str], tags=["Locks"])
-def unlock_door(lock = Depends(get_lock_by_id)):
+def unlock_door(confirm: bool = Query(...), lock = Depends(get_lock_by_id)):
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Missing confirmation parameter")
     try:
         lock.unlock()
         return {"status": "success", "message": "Door unlocked successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to unlock door")
 
 @app.get("/locks/{device_id}/logs", response_model=List[LockLogResponse], tags=["Logs"])
 def get_logs(lock = Depends(get_lock_by_id)):
@@ -237,40 +288,42 @@ def get_logs(lock = Depends(get_lock_by_id)):
                 access_code_id=getattr(log, "access_code_id", None)
             ) for log in logs
         ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch logs")
 
 @app.get("/locks/{device_id}/access_codes", response_model=List[AccessCodeResponse], tags=["Access Codes"])
 def list_access_codes(lock = Depends(get_lock_by_id)):
     try:
         codes = lock.access_codes()
-        return [
-            AccessCodeResponse(
-                access_code_id=getattr(code, 'access_code_id', None),
-                name=code.name,
-                code=code.code
-            ) for code in codes
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return [AccessCodeResponse.masked(code) for code in codes]
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch access codes")
 
 @app.post("/locks/{device_id}/access_codes", response_model=AccessCodeResponse, tags=["Access Codes"])
 def create_access_code(access_code: AccessCodeBase, lock = Depends(get_lock_by_id)):
     try:
         new_code = pyschlage.AccessCode(name=access_code.name, code=access_code.code)
         lock.add_access_code(new_code)
-        return AccessCodeResponse(
-            access_code_id=getattr(new_code, 'access_code_id', None),
-            name=new_code.name,
-            code=new_code.code
+        return AccessCodeResponse.masked(new_code)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to create access code")
+
+@app.post("/auth/refresh", response_model=TokenResponse, tags=["Authentication"])
+def refresh_token(token: str = Depends(oauth2_scheme)):
+    session = _active_sessions.get(token)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    session["created_at"] = time.time()
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.delete("/locks/{device_id}/access_codes/{access_code_id}", response_model=Dict[str, str], tags=["Access Codes"])
 def delete_access_code(access_code_id: str, lock = Depends(get_lock_by_id)):
     try:
         lock.delete_access_code(access_code_id)
         return {"status": "success", "message": f"Access code {access_code_id} deleted"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to delete access code")
