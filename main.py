@@ -1,6 +1,9 @@
 import os
 import secrets
+import time
+import asyncio
 from typing import List, Optional, Dict
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
@@ -45,10 +48,17 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(cleanup_expired_sessions())
+    yield
+    task.cancel()
+
 app = FastAPI(
     title="Schlage Lock API",
     description="FastAPI wrapper for pyschlage with Bearer Token Authentication.",
-    version="1.1.0"
+    version="1.1.0",
+    lifespan=lifespan
 )
 
 limiter = Limiter(key_func=get_remote_address, headers_enabled=True)
@@ -57,9 +67,28 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
-_active_sessions: Dict[str, pyschlage.Schlage] = {}
+SESSION_TTL = 86400
+CLEANUP_INTERVAL = 3600
+
+_active_sessions: Dict[str, dict] = {}
+_user_tokens: Dict[str, str] = {}
 
 API_SECRET = os.environ.get("API_SECRET")
+
+
+async def cleanup_expired_sessions():
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        now = time.time()
+        expired = [
+            token for token, session in _active_sessions.items()
+            if now - session["created_at"] > SESSION_TTL
+        ]
+        for token in expired:
+            username = _active_sessions[token]["username"]
+            if _user_tokens.get(username) == token:
+                del _user_tokens[username]
+            del _active_sessions[token]
 
 @app.middleware("http")
 async def check_api_secret(request: Request, call_next):
@@ -82,14 +111,23 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 def get_current_client(token: str = Depends(oauth2_scheme)) -> pyschlage.Schlage:
-    client = _active_sessions.get(token)
-    if not client:
+    session = _active_sessions.get(token)
+    if not session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired authentication token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return client
+    if time.time() - session["created_at"] > SESSION_TTL:
+        if _user_tokens.get(session["username"]) == token:
+            del _user_tokens[session["username"]]
+        del _active_sessions[token]
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return session["client"]
 
 def get_lock_by_id(device_id: str, client: pyschlage.Schlage = Depends(get_current_client)):
     try:
@@ -107,11 +145,21 @@ def get_lock_by_id(device_id: str, client: pyschlage.Schlage = Depends(get_curre
 @limiter.limit("60/minute")
 def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     try:
-        auth = pyschlage.Auth(form_data.username, form_data.password)
+        username = form_data.username
+        if username in _user_tokens:
+            old_token = _user_tokens[username]
+            if old_token in _active_sessions:
+                del _active_sessions[old_token]
+        auth = pyschlage.Auth(username, form_data.password)
         client = pyschlage.Schlage(auth)
         client.locks()
         token = secrets.token_urlsafe(32)
-        _active_sessions[token] = client
+        _active_sessions[token] = {
+            "username": username,
+            "client": client,
+            "created_at": time.time(),
+        }
+        _user_tokens[username] = token
         return {"access_token": token, "token_type": "bearer"}
     except Exception as e:
         raise HTTPException(
@@ -122,7 +170,11 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
 
 @app.post("/auth/logout", tags=["Authentication"])
 def logout(token: str = Depends(oauth2_scheme)):
-    if token in _active_sessions:
+    session = _active_sessions.get(token)
+    if session:
+        username = session["username"]
+        if _user_tokens.get(username) == token:
+            del _user_tokens[username]
         del _active_sessions[token]
     return {"status": "success", "message": "Successfully logged out"}
 
