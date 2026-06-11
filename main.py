@@ -5,7 +5,7 @@ import asyncio
 import logging
 from typing import List, Optional, Dict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, status, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
@@ -190,7 +190,7 @@ def health_check():
 
 @app.post("/auth/token", response_model=TokenResponse, tags=["Authentication"])
 @limiter.limit("60/minute")
-def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+def login(request: Request, response: Response, form_data: OAuth2PasswordRequestForm = Depends()):
     try:
         username = form_data.username
         if username in _user_tokens:
